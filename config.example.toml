@@ -1,0 +1,16 @@
+[source]
+product_id = 2
+
+[source.filters]
+duplicate = false
+false_p = true
+
+[destination]
+product_ids = [1, 4]
+
+[matching]
+trim_title = true
+require_found_by = true
+
+[output]
+directory = "output"

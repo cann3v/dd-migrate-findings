@@ -1,0 +1,11 @@
+[package]
+name = "dd-migrate-findings"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version =  "4.6.4", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.19"
+toml = "1.1.3"
+url = "2.5.8"
