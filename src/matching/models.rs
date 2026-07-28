@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SourceCoverageClass {
     ExactMatch,
     PossibleMatch,
@@ -27,7 +29,7 @@ impl SourceCoverageClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetActionClass {
     ReadyToApply,
     AlreadyUpToDate,
@@ -50,7 +52,7 @@ impl TargetActionClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum NotFoundReason {
     DifferentLine,
     DifferentFilePath,
@@ -79,7 +81,7 @@ impl NotFoundReason {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceCorrelation {
     pub source_finding_id: u64,
     pub source_title: String,
@@ -128,7 +130,7 @@ impl SourceCorrelation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetOperation {
     pub source_finding_id: u64,
     pub source_title: String,

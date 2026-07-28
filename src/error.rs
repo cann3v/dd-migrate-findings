@@ -117,4 +117,87 @@ pub enum AppError {
 
     #[error("{0}")]
     StageNotImplemented(String),
+
+    #[error("migration plan invariant failed: {0}")]
+    PlanInvariant(String),
+
+    #[error(
+    "failed to create output directory '{}': {source}",
+    path.display()
+    )]
+    CreateOutputDirectory {
+        path: PathBuf,
+
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+    "failed to create output file '{}': {source}",
+    path.display()
+    )]
+    CreateOutputFile {
+        path: PathBuf,
+
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+    "failed to write JSON file '{}': {source}",
+    path.display()
+    )]
+    WriteJson {
+        path: PathBuf,
+
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error(
+    "CSV operation failed for '{}': {source}",
+    path.display()
+    )]
+    Csv {
+        path: PathBuf,
+
+        #[source]
+        source: csv::Error,
+    },
+
+    #[error(
+    "failed to flush output file '{}': {source}",
+    path.display()
+    )]
+    FlushOutputFile {
+        path: PathBuf,
+
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+    "failed to read migration plan '{}': {source}",
+    path.display()
+    )]
+    ReadPlan {
+        path: PathBuf,
+
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+    "failed to decode migration plan '{}': {source}",
+    path.display()
+    )]
+    DecodePlan {
+        path: PathBuf,
+
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("decision file is invalid: {0}")]
+    InvalidDecisionFile(String),
 }

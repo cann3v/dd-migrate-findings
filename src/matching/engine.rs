@@ -487,13 +487,9 @@ mod tests {
         target.component_version = None;
         target.line = Some(43);
 
-        let report =
-            correlate_findings(&[source], &[target], 4);
+        let report = correlate_findings(&[source], &[target], 4);
 
-        assert_eq!(
-            report.sources[0].class,
-            SourceCoverageClass::NotFound
-        );
+        assert_eq!(report.sources[0].class, SourceCoverageClass::NotFound);
 
         assert_eq!(
             report.sources[0].not_found_reasons,

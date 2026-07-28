@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod error;
 mod matching;
+mod plan;
 mod progress;
 
 use std::path::Path;
@@ -19,6 +20,7 @@ use crate::matching::{
     CorrelationReport, NotFoundReason, SourceCorrelation, SourceCoverageClass, TargetActionClass,
     TargetOperation, correlate_findings,
 };
+use crate::plan::{MigrationPlanBuilder, validate_decision_file, write_plan_files};
 use crate::progress::DownloadProgress;
 
 #[tokio::main]
@@ -31,23 +33,26 @@ async fn main() {
 
 async fn run() -> Result<(), AppError> {
     let cli = Cli::parse();
-
     let config = AppConfig::load(&cli.config)?;
-    let environment = RuntimeEnvironment::load()?;
 
     match cli.command {
         Command::Plan(arguments) => {
-            run_read_only_correlation(&config, &environment, &arguments.output_name).await
+            let environment = RuntimeEnvironment::load()?;
+
+            run_plan(&config, &environment, &arguments.output_name).await
         }
 
         Command::Validate(arguments) => {
             ensure_input_file(&arguments.decisions)?;
 
-            Err(AppError::StageNotImplemented(format!(
-                "configuration and environment are valid, but \
-                 validation of '{}' will be implemented at stage 4",
-                arguments.decisions.display()
-            )))
+            let summary = validate_decision_file(&arguments.decisions)?;
+
+            println!("Decision file is valid.");
+            println!("Rows: {}", summary.total_rows);
+            println!("apply_all: {}", summary.apply_all_rows);
+            println!("skip: {}", summary.skip_rows);
+
+            Ok(())
         }
 
         Command::Apply(arguments) => {
@@ -55,21 +60,20 @@ async fn run() -> Result<(), AppError> {
 
             match arguments.execution_mode() {
                 ExecutionMode::DryRun => Err(AppError::StageNotImplemented(format!(
-                    "configuration and environment are valid, but \
-                         dry-run application of '{}' will be implemented \
-                         at stage 7",
+                    "decision file '{}' can be validated, but \
+                         apply dry-run will be implemented at stage 5",
                     arguments.decisions.display()
                 ))),
 
                 ExecutionMode::Execute => Err(AppError::StageNotImplemented(
-                    "write operations are disabled in stage 3.1".to_owned(),
+                    "write operations are disabled in stage 4".to_owned(),
                 )),
             }
         }
     }
 }
 
-async fn run_read_only_correlation(
+async fn run_plan(
     config: &AppConfig,
     environment: &RuntimeEnvironment,
     output_name: &str,
@@ -121,6 +125,13 @@ async fn run_read_only_correlation(
         println!("Sample notes: {}", notes.notes.len());
     }
 
+    let mut plan_builder = MigrationPlanBuilder::new(
+        environment.base_url.to_string(),
+        source_product,
+        config.source.filters.clone(),
+        source_findings.clone(),
+    );
+
     println!();
     println!("Destination correlation:");
 
@@ -153,14 +164,24 @@ async fn run_read_only_correlation(
         println!("  Correlation time: {correlation_elapsed:?}");
 
         print_report(&report);
+
+        plan_builder.add_destination(product, &destination_findings, report)?;
     }
+
+    let plan = plan_builder.build();
+
+    let written = write_plan_files(&plan, &config.output.directory, output_name)?;
+
+    println!();
+    println!("Migration plan created.");
+    println!("JSON: {}", written.json_path.display());
+    println!("CSV:  {}", written.csv_path.display());
+    println!();
+    println!("No changes were made to DefectDojo.");
+    println!("Only GET requests were sent to DefectDojo.");
 
     println!();
     println!("Output directory: {}", config.output.directory.display());
-    println!("Future plan name: {output_name}");
-    println!();
-    println!("No changes were made.");
-    println!("Only GET requests were sent to DefectDojo.");
 
     Ok(())
 }
