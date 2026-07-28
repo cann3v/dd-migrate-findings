@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::api::models::Finding;
+use crate::api::models::{Finding, Note};
 use crate::plan::{ApprovedOperation, MigrationPlan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,10 +32,12 @@ impl DryRunOutcome {
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "prepared status fields will be serialized into PATCH requests at the next stage"
-)]
+#[derive(Debug, Clone)]
+pub struct PreparedFindingNote {
+    pub source_note_id: u64,
+    pub entry: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedFindingPatch {
     pub active: bool,
@@ -49,6 +51,8 @@ pub struct PreparedFindingPatch {
     pub description: Option<String>,
     pub mitigation: Option<String>,
     pub impact: Option<String>,
+
+    pub notes: Vec<PreparedFindingNote>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +75,8 @@ pub fn build_dry_run_report(
     approved_operations: &[ApprovedOperation],
     current_sources: &HashMap<u64, Finding>,
     current_targets: &HashMap<u64, Finding>,
+    current_source_notes: &HashMap<u64, Vec<Note>>,
+    current_target_notes: &HashMap<u64, Vec<Note>>,
 ) -> DryRunReport {
     let planned_sources = plan
         .source_findings
@@ -117,7 +123,21 @@ pub fn build_dry_run_report(
             continue;
         }
 
-        let patch = prepare_patch(plan, current_source, current_target);
+        let source_notes = current_source_notes
+            .get(&operation.source_finding_id)
+            .map_or(&[][..], Vec::as_slice);
+
+        let target_notes = current_target_notes
+            .get(&operation.target_finding_id)
+            .map_or(&[][..], Vec::as_slice);
+
+        let patch = prepare_patch(
+            plan,
+            current_source,
+            current_target,
+            source_notes,
+            target_notes,
+        );
 
         items.push(item(operation, DryRunOutcome::Ready, Some(patch)));
     }
@@ -125,7 +145,13 @@ pub fn build_dry_run_report(
     DryRunReport { items }
 }
 
-fn prepare_patch(plan: &MigrationPlan, source: &Finding, target: &Finding) -> PreparedFindingPatch {
+fn prepare_patch(
+    plan: &MigrationPlan,
+    source: &Finding,
+    target: &Finding,
+    source_notes: &[Note],
+    target_notes: &[Note],
+) -> PreparedFindingPatch {
     PreparedFindingPatch {
         active: source.active,
         verified: source.verified,
@@ -161,6 +187,8 @@ fn prepare_patch(plan: &MigrationPlan, source: &Finding, target: &Finding) -> Pr
             source.impact.as_deref(),
             target.impact.as_deref(),
         ),
+
+        notes: prepare_notes(plan, source, source_notes, target_notes),
     }
 }
 
@@ -205,6 +233,74 @@ fn prepare_text_field(
         Some(transferred)
     } else {
         Some(format!("{transferred}\n\n---\n\n{target_value}"))
+    }
+}
+
+fn prepare_notes(
+    plan: &MigrationPlan,
+    source: &Finding,
+    source_notes: &[Note],
+    target_notes: &[Note],
+) -> Vec<PreparedFindingNote> {
+    source_notes
+        .iter()
+        .filter(|source_note| !source_note.entry.trim().is_empty())
+        .filter_map(|source_note| {
+            let marker = note_marker(plan.source_product.id, source.id, source_note.id);
+
+            let already_transferred = target_notes
+                .iter()
+                .any(|target_note| target_note.entry.contains(&marker));
+
+            if already_transferred {
+                return None;
+            }
+
+            let author = format_note_author(source_note);
+
+            let entry = format!(
+                "{marker}\n\
+                 Перенесено из продукта {} [{}], finding #{}\n\
+                 Автор исходной заметки: {author}\n\
+                 Дата исходной заметки: {}\n\n\
+                 ---\n\n\
+                 {}",
+                plan.source_product.name,
+                plan.source_product.id,
+                source.id,
+                source_note.date,
+                source_note.entry
+            );
+
+            Some(PreparedFindingNote {
+                source_note_id: source_note.id,
+                entry,
+            })
+        })
+        .collect()
+}
+
+fn note_marker(source_product_id: u64, source_finding_id: u64, source_note_id: u64) -> String {
+    format!(
+        "[dojo-migrate source-product={source_product_id} \
+         source-finding={source_finding_id} \
+         source-note={source_note_id}]"
+    )
+}
+
+fn format_note_author(note: &Note) -> String {
+    let full_name = format!(
+        "{} {}",
+        note.author.first_name.trim(),
+        note.author.last_name.trim()
+    );
+
+    let full_name = full_name.trim();
+
+    if full_name.is_empty() {
+        note.author.username.clone()
+    } else {
+        format!("{full_name} (@{})", note.author.username)
     }
 }
 
@@ -276,6 +372,19 @@ mod tests {
         }
     }
 
+    fn note(id: u64, entry: &str) -> Note {
+        Note {
+            id,
+            author: crate::api::models::UserStub {
+                username: "analyst".to_owned(),
+                first_name: "Alice".to_owned(),
+                last_name: "Tester".to_owned(),
+            },
+            date: "2026-07-29T10:15:00Z".to_owned(),
+            entry: entry.to_owned(),
+        }
+    }
+
     #[test]
     fn transferred_text_is_added_above_target_text() {
         let mut source = finding(1);
@@ -283,7 +392,13 @@ mod tests {
 
         source.description = "source description".to_owned();
 
-        let patch = prepare_patch(&plan(source.clone(), target.clone()), &source, &target);
+        let patch = prepare_patch(
+            &plan(source.clone(), target.clone()),
+            &source,
+            &target,
+            &[],
+            &[],
+        );
 
         let description = patch.description.unwrap();
 
@@ -300,7 +415,13 @@ mod tests {
         let source = finding(1);
         let target = finding(2);
 
-        let patch = prepare_patch(&plan(source.clone(), target.clone()), &source, &target);
+        let patch = prepare_patch(
+            &plan(source.clone(), target.clone()),
+            &source,
+            &target,
+            &[],
+            &[],
+        );
 
         assert!(patch.description.is_none());
     }
@@ -317,8 +438,93 @@ mod tests {
         )
         .to_owned();
 
-        let patch = prepare_patch(&plan(source.clone(), target.clone()), &source, &target);
+        let patch = prepare_patch(
+            &plan(source.clone(), target.clone()),
+            &source,
+            &target,
+            &[],
+            &[],
+        );
 
         assert!(patch.description.is_none());
+    }
+
+    #[test]
+    fn source_note_is_prepared_for_transfer() {
+        let source = finding(1);
+        let target = finding(2);
+        let source_notes = vec![note(100, "Original analyst comment")];
+
+        let patch = prepare_patch(
+            &plan(source.clone(), target.clone()),
+            &source,
+            &target,
+            &source_notes,
+            &[],
+        );
+
+        assert_eq!(patch.notes.len(), 1);
+
+        let prepared = &patch.notes[0];
+
+        assert_eq!(prepared.source_note_id, 100);
+        assert!(prepared.entry.contains(
+            "[dojo-migrate source-product=2 \
+             source-finding=1 source-note=100]"
+        ));
+        assert!(
+            prepared
+                .entry
+                .contains("Автор исходной заметки: Alice Tester (@analyst)")
+        );
+        assert!(
+            prepared
+                .entry
+                .contains("Дата исходной заметки: 2026-07-29T10:15:00Z")
+        );
+        assert!(prepared.entry.ends_with("Original analyst comment"));
+    }
+
+    #[test]
+    fn existing_note_marker_prevents_duplicate_transfer() {
+        let source = finding(1);
+        let target = finding(2);
+        let source_notes = vec![note(100, "Original analyst comment")];
+
+        let target_notes = vec![note(
+            200,
+            concat!(
+                "[dojo-migrate source-product=2 ",
+                "source-finding=1 source-note=100]\n",
+                "Previously transferred"
+            ),
+        )];
+
+        let patch = prepare_patch(
+            &plan(source.clone(), target.clone()),
+            &source,
+            &target,
+            &source_notes,
+            &target_notes,
+        );
+
+        assert!(patch.notes.is_empty());
+    }
+
+    #[test]
+    fn empty_source_note_is_not_prepared() {
+        let source = finding(1);
+        let target = finding(2);
+        let source_notes = vec![note(100, "   \n")];
+
+        let patch = prepare_patch(
+            &plan(source.clone(), target.clone()),
+            &source,
+            &target,
+            &source_notes,
+            &[],
+        );
+
+        assert!(patch.notes.is_empty());
     }
 }

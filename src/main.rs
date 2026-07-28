@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 
 use crate::api::DefectDojoClient;
-use crate::api::models::Finding;
+use crate::api::models::{Finding, Note};
 use crate::cli::{Cli, Command, ExecutionMode};
 use crate::config::{AppConfig, RuntimeEnvironment};
 use crate::dry_run::{DryRunOutcome, DryRunReport, build_dry_run_report};
@@ -399,21 +399,46 @@ async fn run_apply_dry_run(
         .map(|finding| (finding.id, finding))
         .collect::<HashMap<_, _>>();
 
+    let source_note_ids = decisions
+        .operations
+        .iter()
+        .map(|operation| operation.source_finding_id)
+        .collect::<BTreeSet<_>>();
+
+    let source_notes_progress = ItemProgress::new(source_note_ids.len(), "Loading source notes");
+
+    let mut current_source_notes = HashMap::<u64, Vec<Note>>::new();
+
+    for source_id in source_note_ids {
+        let notes = client.get_finding_notes(source_id).await?;
+
+        current_source_notes.insert(source_id, notes.notes);
+        source_notes_progress.increment();
+    }
+
+    source_notes_progress.finish();
+
     let target_ids = decisions
         .operations
         .iter()
         .map(|operation| operation.target_finding_id)
         .collect::<BTreeSet<_>>();
 
-    let target_progress =
-        ItemProgress::new(target_ids.len(), "Refreshing selected target findings");
+    let target_progress = ItemProgress::new(
+        target_ids.len(),
+        "Refreshing selected target findings and notes",
+    );
 
     let mut current_targets = HashMap::new();
+    let mut current_target_notes = HashMap::<u64, Vec<Note>>::new();
 
     for target_id in target_ids {
         let finding = client.get_finding(target_id).await?;
+        let notes = client.get_finding_notes(target_id).await?;
 
         current_targets.insert(target_id, finding);
+        current_target_notes.insert(target_id, notes.notes);
+
         target_progress.increment();
     }
 
@@ -424,6 +449,8 @@ async fn run_apply_dry_run(
         &decisions.operations,
         &current_sources,
         &current_targets,
+        &current_source_notes,
+        &current_target_notes,
     );
 
     print_dry_run_report(&report);
@@ -502,6 +529,7 @@ fn print_dry_run_report(report: &DryRunReport) {
     let mut description_updates = 0;
     let mut mitigation_updates = 0;
     let mut impact_updates = 0;
+    let mut note_additions = 0;
 
     for patch in ready {
         description_updates += usize::from(patch.description.is_some());
@@ -509,12 +537,15 @@ fn print_dry_run_report(report: &DryRunReport) {
         mitigation_updates += usize::from(patch.mitigation.is_some());
 
         impact_updates += usize::from(patch.impact.is_some());
+
+        note_additions += patch.notes.len();
     }
 
     println!("Prepared text additions:");
     println!("  description: {description_updates}");
     println!("  mitigation:  {mitigation_updates}");
     println!("  impact:      {impact_updates}");
+    println!("Prepared note additions: {note_additions}");
 
     print_dry_run_problem_examples(report);
 }
