@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
+use reqwest::Method;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use toml::Value;
 use url::Url;
 
-use crate::api::models::{Finding, FindingToNotes, PaginatedResponse, Product};
+use crate::api::models::{
+    CreateFindingNoteRequest, Finding, FindingPatchRequest, FindingToNotes, Note,
+    PaginatedResponse, Product,
+};
 use crate::config::{HttpConfig, RuntimeEnvironment};
 use crate::error::AppError;
 
@@ -94,6 +99,26 @@ impl DefectDojoClient {
         let url = self.endpoint(&format!("api/v2/findings/{finding_id}/notes/"))?;
 
         self.get_json(url).await
+    }
+
+    pub async fn patch_finding(
+        &self,
+        finding_id: u64,
+        request: &FindingPatchRequest,
+    ) -> Result<Finding, AppError> {
+        let url = self.endpoint(&format!("api/v2/findings/{finding_id}/"))?;
+
+        self.send_json(Method::PATCH, "PATCH", url, request).await
+    }
+
+    pub async fn create_finding_note(
+        &self,
+        finding_id: u64,
+        request: &CreateFindingNoteRequest,
+    ) -> Result<Note, AppError> {
+        let url = self.endpoint(&format!("api/v2/findings/{finding_id}/notes/"))?;
+
+        self.send_json(Method::POST, "POST", url, request).await
     }
 
     async fn get_all_pages<T>(
@@ -190,6 +215,58 @@ impl DefectDojoClient {
 
         serde_json::from_str(&body).map_err(|source| AppError::DecodeResponse {
             method: "GET",
+            url: url.to_string(),
+            source,
+        })
+    }
+
+    async fn send_json<Request, Response>(
+        &self,
+        method: Method,
+        method_name: &'static str,
+        url: Url,
+        request: &Request,
+    ) -> Result<Response, AppError>
+    where
+        Request: Serialize + ?Sized,
+        Response: DeserializeOwned,
+    {
+        self.ensure_same_origin(&url)?;
+
+        let response = self
+            .http
+            .request(method, url.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|source| AppError::HttpRequest {
+                method: method_name,
+                url: url.to_string(),
+                source,
+            })?;
+
+        let status = response.status();
+
+        let body = response
+            .text()
+            .await
+            .map_err(|source| AppError::ReadResponseBody {
+                method: method_name,
+                url: url.to_string(),
+                source,
+            })?;
+
+        if !status.is_success() {
+            return Err(AppError::ApiStatus {
+                method: method_name,
+                url: url.to_string(),
+                status,
+                body: truncate_body(&body),
+            });
+        }
+
+        serde_json::from_str(&body).map_err(|source| AppError::DecodeResponse {
+            method: method_name,
             url: url.to_string(),
             source,
         })
