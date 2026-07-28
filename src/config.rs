@@ -23,6 +23,9 @@ pub struct AppConfig {
     pub matching: MatchingConfig,
 
     #[serde(default)]
+    pub http: HttpConfig,
+
+    #[serde(default)]
     pub output: OutputConfig,
 }
 
@@ -67,6 +70,26 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             directory: PathBuf::from("output"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpConfig {
+    pub timeout_seconds: u64,
+    pub page_size: usize,
+    pub max_pages: usize,
+    pub accept_invalid_certificates: bool,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 30,
+            page_size: 200,
+            max_pages: 10_000,
+            accept_invalid_certificates: false,
         }
     }
 }
@@ -132,11 +155,37 @@ impl AppConfig {
             );
         }
 
+        if self.http.timeout_seconds == 0 {
+            errors.push("http.timeout_seconds must be greater than 0".to_owned());
+        }
+
+        if self.http.page_size == 0 {
+            errors.push("http.page_size must be greater than 0".to_owned());
+        }
+
+        if self.http.page_size > 1_000 {
+            errors.push("http.page_size cannot be greater than 1000".to_owned());
+        }
+
+        if self.http.max_pages == 0 {
+            errors.push("http.max_pages must be greater than 0".to_owned());
+        }
+
         if self.output.directory.as_os_str().is_empty() {
             errors.push("output.directory cannot be empty".to_owned());
         }
 
         for (name, value) in &self.source.filters {
+            if matches!(
+                name.as_str(),
+                "test__engagement__product" | "limit" | "offset"
+            ) {
+                errors.push(format!(
+                    "source filter '{name}' is managed by the application \
+                    and cannot be set in the configuration"
+                ));
+            }
+
             validate_filter_name(name, &mut errors);
             validate_filter_value(name, value, &mut errors);
         }
@@ -302,6 +351,7 @@ mod tests {
                 product_ids: vec![1, 4],
             },
             matching: MatchingConfig::default(),
+            http: HttpConfig::default(),
             output: OutputConfig::default(),
         }
     }
@@ -367,5 +417,19 @@ mod tests {
             normalize_base_url(url).as_str(),
             "https://dojo.example.org/api/"
         );
+    }
+
+    #[test]
+    fn application_managed_filter_is_rejected() {
+        let mut config = valid_config();
+
+        config
+            .source
+            .filters
+            .insert("limit".to_owned(), Value::Integer(500));
+
+        let error = config.validate().unwrap_err().to_string();
+
+        assert!(error.contains("source filter 'limit' is managed by the application"));
     }
 }

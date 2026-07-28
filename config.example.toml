@@ -12,5 +12,11 @@ product_ids = [1, 4]
 trim_title = true
 require_found_by = true
 
+[http]
+timeout_seconds = 30
+page_size = 500
+max_pages = 10000
+accept_invalid_certificates = false
+
 [output]
 directory = "output"
