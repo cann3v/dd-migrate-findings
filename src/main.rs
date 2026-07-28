@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod dry_run;
 mod error;
+mod execution;
 mod matching;
 mod plan;
 mod progress;
@@ -19,6 +20,9 @@ use crate::cli::{Cli, Command, ExecutionMode};
 use crate::config::{AppConfig, RuntimeEnvironment};
 use crate::dry_run::{DryRunOutcome, DryRunReport, build_dry_run_report};
 use crate::error::AppError;
+use crate::execution::{
+    ExecutionOutcome, ExecutionReport, execute_migration, write_execution_report,
+};
 use crate::matching::{
     CorrelationReport, NotFoundReason, SourceCorrelation, SourceCoverageClass, TargetActionClass,
     TargetOperation, correlate_findings,
@@ -64,17 +68,10 @@ async fn run() -> Result<(), AppError> {
         Command::Apply(arguments) => {
             ensure_input_file(&arguments.decisions)?;
 
-            match arguments.execution_mode() {
-                ExecutionMode::DryRun => {
-                    let environment = RuntimeEnvironment::load()?;
+            let environment = RuntimeEnvironment::load()?;
+            let execution_mode = arguments.execution_mode();
 
-                    run_apply_dry_run(&config, &environment, &arguments.decisions).await
-                }
-
-                ExecutionMode::Execute => Err(AppError::StageNotImplemented(
-                    "write operations are disabled in stage 5".to_owned(),
-                )),
-            }
+            run_apply(&config, &environment, &arguments.decisions, execution_mode).await
         }
     }
 }
@@ -361,10 +358,11 @@ fn format_ids(ids: &[u64]) -> String {
         .join(", ")
 }
 
-async fn run_apply_dry_run(
+async fn run_apply(
     config: &AppConfig,
     environment: &RuntimeEnvironment,
     decisions_path: &Path,
+    execution_mode: ExecutionMode,
 ) -> Result<(), AppError> {
     let decisions = load_approved_decisions(decisions_path)?;
 
@@ -372,7 +370,16 @@ async fn run_apply_dry_run(
 
     let client = DefectDojoClient::new(environment, &config.http)?;
 
-    println!("DefectDojo migration dry-run");
+    match execution_mode {
+        ExecutionMode::DryRun => {
+            println!("DefectDojo migration dry-run");
+        }
+
+        ExecutionMode::Execute => {
+            println!("DefectDojo migration execution");
+        }
+    }
+
     println!("Approved operations: {}", decisions.operations.len());
     println!();
 
@@ -455,9 +462,58 @@ async fn run_apply_dry_run(
 
     print_dry_run_report(&report);
 
+    if execution_mode == ExecutionMode::DryRun {
+        println!();
+        println!("No changes were made.");
+        println!("No PATCH or POST requests were sent.");
+
+        return Ok(());
+    }
+
+    let blocked_operations = report
+        .items
+        .iter()
+        .filter(|item| item.outcome != DryRunOutcome::Ready)
+        .count();
+
+    if blocked_operations != 0 {
+        return Err(AppError::ExecutionPreflightFailed {
+            blocked: blocked_operations,
+        });
+    }
+
     println!();
-    println!("No changes were made.");
-    println!("No PATCH or POST requests were sent.");
+    println!("Preflight passed.");
+    println!("Starting PATCH and POST requests.");
+
+    let execution_report = execute_migration(
+        &client,
+        &decisions.plan,
+        &report,
+        &current_sources,
+        &current_source_notes,
+        &mut current_targets,
+        &mut current_target_notes,
+    )
+    .await;
+
+    print_execution_report(&execution_report);
+
+    let report_path = write_execution_report(&execution_report, decisions_path)?;
+
+    println!("Execution report: {}", report_path.display());
+
+    let failures = execution_report.failure_count();
+
+    if failures != 0 {
+        return Err(AppError::MigrationWriteFailures {
+            failed: failures,
+            report_path,
+        });
+    }
+
+    println!();
+    println!("Migration completed successfully.");
 
     Ok(())
 }
@@ -548,6 +604,74 @@ fn print_dry_run_report(report: &DryRunReport) {
     println!("Prepared note additions: {note_additions}");
 
     print_dry_run_problem_examples(report);
+}
+
+fn print_execution_report(report: &ExecutionReport) {
+    println!();
+    println!("Execution results:");
+
+    for outcome in ExecutionOutcome::ALL {
+        let count = report
+            .items
+            .iter()
+            .filter(|item| item.outcome == outcome)
+            .count();
+
+        println!("  {:<24} {}", outcome.label(), count);
+    }
+
+    let successful_patches = report
+        .items
+        .iter()
+        .filter(|item| item.patch_applied)
+        .count();
+
+    let notes_planned = report
+        .items
+        .iter()
+        .map(|item| item.notes_planned)
+        .sum::<usize>();
+
+    let notes_created = report
+        .items
+        .iter()
+        .map(|item| item.notes_created)
+        .sum::<usize>();
+
+    println!("Successful PATCH requests: {successful_patches}");
+    println!("Notes planned:            {notes_planned}");
+    println!("Notes created:            {notes_created}");
+
+    const EXAMPLES: usize = 10;
+
+    let failures = report
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.outcome,
+                ExecutionOutcome::PartiallyApplied | ExecutionOutcome::Failed
+            )
+        })
+        .take(EXAMPLES)
+        .collect::<Vec<_>>();
+
+    if failures.is_empty() {
+        return;
+    }
+
+    println!("Failure examples:");
+
+    for item in failures {
+        println!(
+            "  row {}: source #{} -> target #{} in product {}",
+            item.row_id, item.source_finding_id, item.target_finding_id, item.target_product_id
+        );
+
+        for error in &item.errors {
+            println!("    {error}");
+        }
+    }
 }
 
 fn print_dry_run_problem_examples(report: &DryRunReport) {

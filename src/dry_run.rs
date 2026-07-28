@@ -145,7 +145,7 @@ pub fn build_dry_run_report(
     DryRunReport { items }
 }
 
-fn prepare_patch(
+pub(crate) fn prepare_patch(
     plan: &MigrationPlan,
     source: &Finding,
     target: &Finding,

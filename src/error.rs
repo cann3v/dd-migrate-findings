@@ -211,4 +211,17 @@ pub enum AppError {
         #[source]
         source: io::Error,
     },
+
+    #[error(
+        "execution aborted: {blocked} approved operations failed preflight; \
+         no changes were made"
+    )]
+    ExecutionPreflightFailed { blocked: usize },
+
+    #[error(
+        "migration completed with {failed} failed or partially applied \
+         operations; inspect '{}'",
+        report_path.display()
+    )]
+    MigrationWriteFailures { failed: usize, report_path: PathBuf },
 }

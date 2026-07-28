@@ -9,8 +9,8 @@ use toml::Value;
 use url::Url;
 
 use crate::api::models::{
-    CreateFindingNoteRequest, Finding, FindingPatchRequest, FindingToNotes, Note,
-    PaginatedResponse, Product,
+    CreateFindingNoteRequest, Finding, FindingPatchRequest, FindingToNotes, PaginatedResponse,
+    Product,
 };
 use crate::config::{HttpConfig, RuntimeEnvironment};
 use crate::error::AppError;
@@ -115,7 +115,7 @@ impl DefectDojoClient {
         &self,
         finding_id: u64,
         request: &CreateFindingNoteRequest,
-    ) -> Result<Note, AppError> {
+    ) -> Result<FindingToNotes, AppError> {
         let url = self.endpoint(&format!("api/v2/findings/{finding_id}/notes/"))?;
 
         self.send_json(Method::POST, "POST", url, request).await
