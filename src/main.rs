@@ -3,17 +3,23 @@ mod cli;
 mod config;
 mod error;
 mod matching;
+mod progress;
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
 use crate::api::DefectDojoClient;
+use crate::api::models::Finding;
 use crate::cli::{Cli, Command, ExecutionMode};
 use crate::config::{AppConfig, RuntimeEnvironment};
 use crate::error::AppError;
-use crate::matching::{CorrelationClass, CorrelationResult, correlate_findings};
+use crate::matching::{
+    CorrelationReport, NotFoundReason, SourceCorrelation, SourceCoverageClass, TargetActionClass,
+    TargetOperation, correlate_findings,
+};
+use crate::progress::DownloadProgress;
 
 #[tokio::main]
 async fn main() {
@@ -38,8 +44,8 @@ async fn run() -> Result<(), AppError> {
             ensure_input_file(&arguments.decisions)?;
 
             Err(AppError::StageNotImplemented(format!(
-                "configuration and environment are valid, but validation \
-                 of '{}' will be implemented at stage 4",
+                "configuration and environment are valid, but \
+                 validation of '{}' will be implemented at stage 4",
                 arguments.decisions.display()
             )))
         }
@@ -56,7 +62,7 @@ async fn run() -> Result<(), AppError> {
                 ))),
 
                 ExecutionMode::Execute => Err(AppError::StageNotImplemented(
-                    "write operations are disabled in stage 3".to_owned(),
+                    "write operations are disabled in stage 3.1".to_owned(),
                 )),
             }
         }
@@ -87,16 +93,20 @@ async fn run_read_only_correlation(
         source_product.id, source_product.name
     );
 
-    let source_started = Instant::now();
-
-    let source_findings = client
-        .list_findings(config.source.product_id, &config.source.filters)
-        .await?;
+    let (source_findings, source_elapsed) = load_findings_with_progress(
+        &client,
+        config.source.product_id,
+        &config.source.filters,
+        format!(
+            "Loading source product [{}] {}",
+            source_product.id, source_product.name
+        ),
+    )
+    .await?;
 
     println!(
-        "Source findings after filters: {} ({:?})",
-        source_findings.len(),
-        source_started.elapsed()
+        "Source findings after filters: {} ({source_elapsed:?})",
+        source_findings.len()
     );
 
     if let Some(sample) = source_findings.first() {
@@ -117,17 +127,20 @@ async fn run_read_only_correlation(
     for product_id in &config.destination.product_ids {
         let product = client.get_product(*product_id).await?;
 
-        let destination_started = Instant::now();
-
-        let destination_findings = client
-            .list_findings(*product_id, &Default::default())
-            .await?;
-
-        let loading_elapsed = destination_started.elapsed();
+        let (destination_findings, loading_elapsed) = load_findings_with_progress(
+            &client,
+            *product_id,
+            &Default::default(),
+            format!(
+                "Loading destination product [{}] {}",
+                product.id, product.name
+            ),
+        )
+        .await?;
 
         let correlation_started = Instant::now();
 
-        let results = correlate_findings(&source_findings, &destination_findings, *product_id);
+        let report = correlate_findings(&source_findings, &destination_findings, *product_id);
 
         let correlation_elapsed = correlation_started.elapsed();
 
@@ -139,8 +152,7 @@ async fn run_read_only_correlation(
         );
         println!("  Correlation time: {correlation_elapsed:?}");
 
-        print_correlation_summary(&results);
-        print_diagnostic_examples(&results);
+        print_report(&report);
     }
 
     println!();
@@ -153,26 +165,79 @@ async fn run_read_only_correlation(
     Ok(())
 }
 
-fn print_correlation_summary(results: &[CorrelationResult]) {
-    println!("  Results:");
+async fn load_findings_with_progress(
+    client: &DefectDojoClient,
+    product_id: u64,
+    filters: &std::collections::BTreeMap<String, toml::Value>,
+    message: String,
+) -> Result<(Vec<Finding>, Duration), AppError> {
+    let progress = DownloadProgress::new(message);
+    let started = Instant::now();
 
-    for class in CorrelationClass::ALL {
-        let count = results
+    let result = client
+        .list_findings(product_id, filters, Some(&progress))
+        .await;
+
+    progress.finish();
+
+    result.map(|findings| (findings, started.elapsed()))
+}
+
+fn print_report(report: &CorrelationReport) {
+    println!("  Source coverage:");
+
+    for class in SourceCoverageClass::ALL {
+        let count = report
+            .sources
             .iter()
             .filter(|result| result.class == class)
             .count();
 
-        println!("    {:<20} {}", class.label(), count);
+        println!("    {:<24} {}", class.label(), count);
     }
+
+    println!("  Target actions:");
+
+    for class in TargetActionClass::ALL {
+        let count = report
+            .target_operations
+            .iter()
+            .filter(|operation| operation.class == class)
+            .count();
+
+        println!("    {:<24} {}", class.label(), count);
+    }
+
+    print_not_found_diagnostics(&report.sources);
+    print_source_examples(&report.sources);
+    print_target_examples(&report.target_operations);
 }
 
-fn print_diagnostic_examples(results: &[CorrelationResult]) {
+fn print_not_found_diagnostics(sources: &[SourceCorrelation]) {
+    println!("  NotFound diagnostic signals:");
+
+    for reason in NotFoundReason::ALL {
+        let count = sources
+            .iter()
+            .filter(|source| {
+                source.class == SourceCoverageClass::NotFound
+                    && source.not_found_reasons.contains(&reason)
+            })
+            .count();
+
+        println!("    {:<24} {}", reason.label(), count);
+    }
+
+    println!("    Note: one NotFound finding may have multiple signals");
+}
+
+fn print_source_examples(sources: &[SourceCorrelation]) {
     const EXAMPLES_PER_CLASS: usize = 3;
 
-    for class in CorrelationClass::ALL {
-        let examples = results
+    for class in SourceCoverageClass::ALL {
+        let examples = sources
             .iter()
-            .filter(|result| result.class == class)
+            .filter(|source| source.class == class)
             .take(EXAMPLES_PER_CLASS)
             .collect::<Vec<_>>();
 
@@ -184,12 +249,42 @@ fn print_diagnostic_examples(results: &[CorrelationResult]) {
 
         for example in examples {
             println!(
-                "    source #{} -> product {} -> [{}] candidates: {} — {}",
+                "    source #{} -> product {} -> \
+                 candidates: {} -> reasons: {} — {}",
                 example.source_finding_id,
                 example.target_product_id,
-                example.class.label(),
                 example.candidate_ids_display(),
+                example.not_found_reasons_display(),
                 sanitize_title(&example.source_title)
+            );
+        }
+    }
+}
+
+fn print_target_examples(operations: &[TargetOperation]) {
+    const EXAMPLES_PER_CLASS: usize = 3;
+
+    for class in TargetActionClass::ALL {
+        let examples = operations
+            .iter()
+            .filter(|operation| operation.class == class)
+            .take(EXAMPLES_PER_CLASS)
+            .collect::<Vec<_>>();
+
+        if examples.is_empty() {
+            continue;
+        }
+
+        println!("  {} target examples:", class.label());
+
+        for operation in examples {
+            println!(
+                "    source #{} -> target #{} \
+                 in product {} — {}",
+                operation.source_finding_id,
+                operation.target_finding_id,
+                operation.target_product_id,
+                sanitize_title(&operation.source_title)
             );
         }
     }

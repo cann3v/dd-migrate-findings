@@ -1,28 +1,47 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::api::models::Finding;
 use crate::matching::keys::{
-    ComponentBaseKey, ComponentKey, FileKey, component_base_key, component_key, file_key,
+    ComponentBaseKey, ComponentKey, FileKey, ScannerTitleKey, TitleKey, component_base_key,
+    component_key, file_key, same_location_ignoring_scanner, scanner_title_key, title_key,
 };
-use crate::matching::models::{CorrelationClass, CorrelationResult};
+use crate::matching::models::{
+    CorrelationReport, NotFoundReason, SourceCorrelation, SourceCoverageClass, TargetActionClass,
+    TargetOperation,
+};
 
 pub fn correlate_findings(
     source_findings: &[Finding],
     target_findings: &[Finding],
     target_product_id: u64,
-) -> Vec<CorrelationResult> {
+) -> CorrelationReport {
     let index = TargetIndex::new(target_findings);
 
-    source_findings
-        .iter()
-        .map(|source| correlate_one(source, &index, target_product_id))
-        .collect()
+    let mut sources = Vec::with_capacity(source_findings.len());
+    let mut target_operations = Vec::new();
+
+    for source in source_findings {
+        correlate_one(
+            source,
+            &index,
+            target_product_id,
+            &mut sources,
+            &mut target_operations,
+        );
+    }
+
+    CorrelationReport {
+        sources,
+        target_operations,
+    }
 }
 
 struct TargetIndex<'a> {
     by_file_key: HashMap<FileKey, Vec<&'a Finding>>,
     by_component_key: HashMap<ComponentKey, Vec<&'a Finding>>,
     by_component_base_key: HashMap<ComponentBaseKey, Vec<&'a Finding>>,
+    by_scanner_title: HashMap<ScannerTitleKey, Vec<&'a Finding>>,
+    by_title: HashMap<TitleKey, Vec<&'a Finding>>,
 }
 
 impl<'a> TargetIndex<'a> {
@@ -31,6 +50,8 @@ impl<'a> TargetIndex<'a> {
             by_file_key: HashMap::new(),
             by_component_key: HashMap::new(),
             by_component_base_key: HashMap::new(),
+            by_scanner_title: HashMap::new(),
+            by_title: HashMap::new(),
         };
 
         for finding in findings {
@@ -49,6 +70,16 @@ impl<'a> TargetIndex<'a> {
                     .or_default()
                     .push(finding);
             }
+
+            if let Some(key) = scanner_title_key(finding) {
+                index.by_scanner_title.entry(key).or_default().push(finding);
+            }
+
+            index
+                .by_title
+                .entry(title_key(finding))
+                .or_default()
+                .push(finding);
         }
 
         index
@@ -95,73 +126,147 @@ impl<'a> TargetIndex<'a> {
 
         candidates
     }
+
+    fn diagnose_not_found(&self, source: &Finding) -> Vec<NotFoundReason> {
+        let mut reasons = BTreeSet::new();
+
+        let same_scanner_and_title = scanner_title_key(source)
+            .and_then(|key| self.by_scanner_title.get(&key))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        if let Some(source_path) = source.file_path.as_deref() {
+            for target in same_scanner_and_title {
+                let Some(target_path) = target.file_path.as_deref() else {
+                    continue;
+                };
+
+                if source_path == target_path && source.line != target.line {
+                    reasons.insert(NotFoundReason::DifferentLine);
+                }
+
+                if source_path != target_path {
+                    reasons.insert(NotFoundReason::DifferentFilePath);
+                }
+            }
+        }
+
+        let same_title = self
+            .by_title
+            .get(&title_key(source))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        let source_scanner = source.found_by.as_slice();
+
+        if same_title.iter().any(|target| {
+            target.found_by.as_slice() != source_scanner
+                && same_location_ignoring_scanner(source, target)
+        }) {
+            reasons.insert(NotFoundReason::ScannerMismatch);
+        }
+
+        if reasons.is_empty() && !same_title.is_empty() {
+            reasons.insert(NotFoundReason::TitleOnlyMatch);
+        }
+
+        if reasons.is_empty() {
+            reasons.insert(NotFoundReason::NoCandidate);
+        }
+
+        reasons.into_iter().collect()
+    }
 }
 
 fn correlate_one(
     source: &Finding,
     index: &TargetIndex<'_>,
     target_product_id: u64,
-) -> CorrelationResult {
+    sources: &mut Vec<SourceCorrelation>,
+    target_operations: &mut Vec<TargetOperation>,
+) {
     let has_file_key = file_key(source).is_some();
     let has_component_key = component_key(source).is_some();
 
     if !has_file_key && !has_component_key {
-        return result(
+        sources.push(source_result(
             source,
             target_product_id,
-            CorrelationClass::InsufficientData,
+            SourceCoverageClass::InsufficientData,
             Vec::new(),
-        );
+            Vec::new(),
+        ));
+
+        return;
     }
 
     let exact_candidates = index.exact_candidates(source);
 
-    if exact_candidates.len() > 1 {
-        return result(
+    if !exact_candidates.is_empty() {
+        let candidate_ids = exact_candidates.keys().copied().collect();
+
+        for target in exact_candidates.values() {
+            target_operations.push(TargetOperation {
+                source_finding_id: source.id,
+                source_title: source.title.clone(),
+                target_product_id,
+                target_finding_id: target.id,
+                class: classify_status(source, target),
+            });
+        }
+
+        sources.push(source_result(
             source,
             target_product_id,
-            CorrelationClass::Ambiguous,
-            exact_candidates.keys().copied().collect(),
-        );
-    }
+            SourceCoverageClass::ExactMatch,
+            candidate_ids,
+            Vec::new(),
+        ));
 
-    if let Some(target) = exact_candidates.values().next() {
-        let class = classify_status(source, target);
-
-        return result(source, target_product_id, class, vec![target.id]);
+        return;
     }
 
     let possible_candidates = index.possible_component_candidates(source);
 
     if !possible_candidates.is_empty() {
-        return result(
+        let class = if possible_candidates.len() == 1 {
+            SourceCoverageClass::PossibleMatch
+        } else {
+            SourceCoverageClass::Ambiguous
+        };
+
+        sources.push(source_result(
             source,
             target_product_id,
-            CorrelationClass::PossibleMatch,
+            class,
             possible_candidates.keys().copied().collect(),
-        );
+            Vec::new(),
+        ));
+
+        return;
     }
 
-    result(
+    sources.push(source_result(
         source,
         target_product_id,
-        CorrelationClass::NotFound,
+        SourceCoverageClass::NotFound,
         Vec::new(),
-    )
+        index.diagnose_not_found(source),
+    ));
 }
 
-fn classify_status(source: &Finding, target: &Finding) -> CorrelationClass {
+fn classify_status(source: &Finding, target: &Finding) -> TargetActionClass {
     if transferred_status(source) == transferred_status(target)
         && source.duplicate == target.duplicate
         && source.risk_accepted == target.risk_accepted
     {
-        return CorrelationClass::AlreadyUpToDate;
+        return TargetActionClass::AlreadyUpToDate;
     }
 
     if is_untriaged_active(target) {
-        CorrelationClass::ReadyToApply
+        TargetActionClass::ReadyToApply
     } else {
-        CorrelationClass::StatusConflict
+        TargetActionClass::StatusConflict
     }
 }
 
@@ -198,18 +303,20 @@ fn is_untriaged_active(finding: &Finding) -> bool {
         && !finding.is_mitigated
 }
 
-fn result(
+fn source_result(
     source: &Finding,
     target_product_id: u64,
-    class: CorrelationClass,
+    class: SourceCoverageClass,
     candidate_ids: Vec<u64>,
-) -> CorrelationResult {
-    CorrelationResult {
+    not_found_reasons: Vec<NotFoundReason>,
+) -> SourceCorrelation {
+    SourceCorrelation {
         source_finding_id: source.id,
         source_title: source.title.clone(),
         target_product_id,
         class,
         candidate_ids,
+        not_found_reasons,
     }
 }
 
@@ -246,29 +353,34 @@ mod tests {
 
         finding.active = false;
         finding.false_p = true;
+        finding.is_mitigated = true;
 
         finding
     }
 
     #[test]
-    fn active_target_is_ready_to_apply() {
+    fn multiple_exact_targets_become_separate_operations() {
         let source = false_positive(1);
-        let target = finding(2);
+        let first_target = finding(2);
+        let second_target = false_positive(3);
 
-        let results = correlate_findings(&[source], &[target], 4);
+        let report = correlate_findings(&[source], &[first_target, second_target], 4);
 
-        assert_eq!(results[0].class, CorrelationClass::ReadyToApply);
-        assert_eq!(results[0].candidate_ids, vec![2]);
-    }
+        assert_eq!(report.sources[0].class, SourceCoverageClass::ExactMatch);
 
-    #[test]
-    fn equal_status_is_already_up_to_date() {
-        let source = false_positive(1);
-        let target = false_positive(2);
+        assert_eq!(report.sources[0].candidate_ids, vec![2, 3]);
 
-        let results = correlate_findings(&[source], &[target], 4);
+        assert_eq!(report.target_operations.len(), 2);
 
-        assert_eq!(results[0].class, CorrelationClass::AlreadyUpToDate);
+        assert_eq!(
+            report.target_operations[0].class,
+            TargetActionClass::ReadyToApply
+        );
+
+        assert_eq!(
+            report.target_operations[1].class,
+            TargetActionClass::AlreadyUpToDate
+        );
     }
 
     #[test]
@@ -276,11 +388,14 @@ mod tests {
         let source = false_positive(1);
         let mut target = finding(2);
 
-        target.verified = true;
+        target.active = false;
 
-        let results = correlate_findings(&[source], &[target], 4);
+        let report = correlate_findings(&[source], &[target], 4);
 
-        assert_eq!(results[0].class, CorrelationClass::StatusConflict);
+        assert_eq!(
+            report.target_operations[0].class,
+            TargetActionClass::StatusConflict
+        );
     }
 
     #[test]
@@ -296,32 +411,40 @@ mod tests {
         target.line = None;
         target.component_version = Some("2.0".to_owned());
 
-        let results = correlate_findings(&[source], &[target], 4);
+        let report = correlate_findings(&[source], &[target], 4);
 
-        assert_eq!(results[0].class, CorrelationClass::PossibleMatch);
-        assert_eq!(results[0].candidate_ids, vec![2]);
+        assert_eq!(report.sources[0].class, SourceCoverageClass::PossibleMatch);
+
+        assert_eq!(report.sources[0].candidate_ids, vec![2]);
     }
 
     #[test]
-    fn version_missing_on_one_side_is_possible_match() {
+    fn multiple_possible_matches_remain_ambiguous() {
         let mut source = false_positive(1);
-        let mut target = finding(2);
+        let mut first_target = finding(2);
+        let mut second_target = finding(3);
 
         source.file_path = None;
         source.line = None;
-        source.component_version = None;
+        source.component_version = Some("1.0".to_owned());
 
-        target.file_path = None;
-        target.line = None;
-        target.component_version = Some("2.0".to_owned());
+        first_target.file_path = None;
+        first_target.line = None;
+        first_target.component_version = Some("2.0".to_owned());
 
-        let results = correlate_findings(&[source], &[target], 4);
+        second_target.file_path = None;
+        second_target.line = None;
+        second_target.component_version = Some("3.0".to_owned());
 
-        assert_eq!(results[0].class, CorrelationClass::PossibleMatch);
+        let report = correlate_findings(&[source], &[first_target, second_target], 4);
+
+        assert_eq!(report.sources[0].class, SourceCoverageClass::Ambiguous);
+
+        assert_eq!(report.sources[0].candidate_ids, vec![2, 3]);
     }
 
     #[test]
-    fn version_missing_on_both_sides_is_exact_match() {
+    fn missing_version_on_both_sides_is_exact() {
         let mut source = false_positive(1);
         let mut target = finding(2);
 
@@ -333,55 +456,75 @@ mod tests {
         target.line = None;
         target.component_version = None;
 
-        let results = correlate_findings(&[source], &[target], 4);
+        let report = correlate_findings(&[source], &[target], 4);
 
-        assert_eq!(results[0].class, CorrelationClass::ReadyToApply);
+        assert_eq!(report.sources[0].class, SourceCoverageClass::ExactMatch);
     }
 
     #[test]
-    fn scanner_is_mandatory() {
+    fn empty_found_by_is_insufficient_data() {
         let mut source = false_positive(1);
-        let target = finding(2);
 
         source.found_by.clear();
 
-        let results = correlate_findings(&[source], &[target], 4);
+        let report = correlate_findings(&[source], &[], 4);
 
-        assert_eq!(results[0].class, CorrelationClass::InsufficientData);
+        assert_eq!(
+            report.sources[0].class,
+            SourceCoverageClass::InsufficientData
+        );
     }
 
     #[test]
-    fn scanner_must_match() {
+    fn different_line_is_explained() {
+        let mut source = false_positive(1);
+        let mut target = finding(2);
+
+        source.component_name = None;
+        source.component_version = None;
+
+        target.component_name = None;
+        target.component_version = None;
+        target.line = Some(43);
+
+        let report =
+            correlate_findings(&[source], &[target], 4);
+
+        assert_eq!(
+            report.sources[0].class,
+            SourceCoverageClass::NotFound
+        );
+
+        assert_eq!(
+            report.sources[0].not_found_reasons,
+            vec![NotFoundReason::DifferentLine]
+        );
+    }
+
+    #[test]
+    fn scanner_mismatch_is_explained() {
         let source = false_positive(1);
         let mut target = finding(2);
 
         target.found_by = vec![999];
 
-        let results = correlate_findings(&[source], &[target], 4);
+        let report = correlate_findings(&[source], &[target], 4);
 
-        assert_eq!(results[0].class, CorrelationClass::NotFound);
+        assert_eq!(
+            report.sources[0].not_found_reasons,
+            vec![NotFoundReason::ScannerMismatch]
+        );
     }
 
     #[test]
-    fn multiple_exact_candidates_are_ambiguous() {
+    fn completely_absent_finding_has_no_candidate() {
         let source = false_positive(1);
-        let first_target = finding(2);
-        let second_target = finding(3);
 
-        let results = correlate_findings(&[source], &[first_target, second_target], 4);
+        let report = correlate_findings(&[source], &[], 4);
 
-        assert_eq!(results[0].class, CorrelationClass::Ambiguous);
-        assert_eq!(results[0].candidate_ids, vec![2, 3]);
-    }
-
-    #[test]
-    fn same_target_found_by_both_branches_is_not_ambiguous() {
-        let source = false_positive(1);
-        let target = finding(2);
-
-        let results = correlate_findings(&[source], &[target], 4);
-
-        assert_eq!(results[0].class, CorrelationClass::ReadyToApply);
-        assert_eq!(results[0].candidate_ids, vec![2]);
+        assert_eq!(
+            report.sources[0].not_found_reasons,
+            vec![NotFoundReason::NoCandidate]
+        );
     }
 }

@@ -63,6 +63,7 @@ impl DefectDojoClient {
         &self,
         product_id: u64,
         filters: &BTreeMap<String, Value>,
+        observer: Option<&dyn PaginationObserver>,
     ) -> Result<Vec<Finding>, AppError> {
         let mut url = self.endpoint("api/v2/findings/")?;
 
@@ -80,7 +81,7 @@ impl DefectDojoClient {
             }
         }
 
-        self.get_all_pages(url).await
+        self.get_all_pages(url, observer).await
     }
 
     pub async fn get_finding_notes(&self, finding_id: u64) -> Result<FindingToNotes, AppError> {
@@ -89,7 +90,11 @@ impl DefectDojoClient {
         self.get_json(url).await
     }
 
-    async fn get_all_pages<T>(&self, mut url: Url) -> Result<Vec<T>, AppError>
+    async fn get_all_pages<T>(
+        &self,
+        mut url: Url,
+        observer: Option<&dyn PaginationObserver>,
+    ) -> Result<Vec<T>, AppError>
     where
         T: DeserializeOwned,
     {
@@ -114,6 +119,10 @@ impl DefectDojoClient {
             }
 
             results.extend(page.results);
+
+            if let Some(observer) = observer {
+                observer.page_loaded(results.len(), expected_count.unwrap_or(results.len()));
+            }
 
             let Some(next) = page.next else {
                 let expected = expected_count.unwrap_or(results.len());
@@ -262,6 +271,10 @@ fn truncate_body(body: &str) -> String {
     } else {
         truncated
     }
+}
+
+pub trait PaginationObserver: Send + Sync {
+    fn page_loaded(&self, loaded_records: usize, total_records: usize);
 }
 
 #[cfg(test)]
