@@ -2,8 +2,10 @@ mod api;
 mod cli;
 mod config;
 mod error;
+mod matching;
 
 use std::path::Path;
+use std::time::Instant;
 
 use clap::Parser;
 
@@ -11,6 +13,7 @@ use crate::api::DefectDojoClient;
 use crate::cli::{Cli, Command, ExecutionMode};
 use crate::config::{AppConfig, RuntimeEnvironment};
 use crate::error::AppError;
+use crate::matching::{CorrelationClass, CorrelationResult, correlate_findings};
 
 #[tokio::main]
 async fn main() {
@@ -28,7 +31,7 @@ async fn run() -> Result<(), AppError> {
 
     match cli.command {
         Command::Plan(arguments) => {
-            run_read_only_inspection(&config, &environment, &arguments.output_name).await
+            run_read_only_correlation(&config, &environment, &arguments.output_name).await
         }
 
         Command::Validate(arguments) => {
@@ -53,14 +56,14 @@ async fn run() -> Result<(), AppError> {
                 ))),
 
                 ExecutionMode::Execute => Err(AppError::StageNotImplemented(
-                    "write operations are disabled in stage 2".to_owned(),
+                    "write operations are disabled in stage 3".to_owned(),
                 )),
             }
         }
     }
 }
 
-async fn run_read_only_inspection(
+async fn run_read_only_correlation(
     config: &AppConfig,
     environment: &RuntimeEnvironment,
     output_name: &str,
@@ -73,7 +76,7 @@ async fn run_read_only_inspection(
 
     let client = DefectDojoClient::new(environment, &config.http)?;
 
-    println!("Read-only DefectDojo inspection");
+    println!("Read-only DefectDojo correlation");
     println!("DefectDojo URL: {}", environment.base_url);
     println!();
 
@@ -84,41 +87,60 @@ async fn run_read_only_inspection(
         source_product.id, source_product.name
     );
 
+    let source_started = Instant::now();
+
     let source_findings = client
         .list_findings(config.source.product_id, &config.source.filters)
         .await?;
 
-    println!("Source findings after filters: {}", source_findings.len());
+    println!(
+        "Source findings after filters: {} ({:?})",
+        source_findings.len(),
+        source_started.elapsed()
+    );
 
     if let Some(sample) = source_findings.first() {
         let notes = client.get_finding_notes(sample.id).await?;
 
-        println!("Sample source finding: #{} — {}", sample.id, sample.title);
         println!(
-            "Sample found_by values: {}",
-            format_product_ids(&sample.found_by)
+            "Sample source finding: #{} — {}",
+            sample.id,
+            sanitize_title(&sample.title)
         );
+        println!("Sample found_by values: {}", format_ids(&sample.found_by));
         println!("Sample notes: {}", notes.notes.len());
-    } else {
-        println!("No source finding is available for notes inspection.");
     }
 
     println!();
-    println!("Destination products:");
+    println!("Destination correlation:");
 
     for product_id in &config.destination.product_ids {
         let product = client.get_product(*product_id).await?;
 
-        let findings = client
+        let destination_started = Instant::now();
+
+        let destination_findings = client
             .list_findings(*product_id, &Default::default())
             .await?;
 
+        let loading_elapsed = destination_started.elapsed();
+
+        let correlation_started = Instant::now();
+
+        let results = correlate_findings(&source_findings, &destination_findings, *product_id);
+
+        let correlation_elapsed = correlation_started.elapsed();
+
+        println!();
+        println!("[{}] {}", product.id, product.name);
         println!(
-            "  [{}] {} — {} findings",
-            product.id,
-            product.name,
-            findings.len()
+            "  Destination findings: {} ({loading_elapsed:?})",
+            destination_findings.len()
         );
+        println!("  Correlation time: {correlation_elapsed:?}");
+
+        print_correlation_summary(&results);
+        print_diagnostic_examples(&results);
     }
 
     println!();
@@ -129,6 +151,65 @@ async fn run_read_only_inspection(
     println!("Only GET requests were sent to DefectDojo.");
 
     Ok(())
+}
+
+fn print_correlation_summary(results: &[CorrelationResult]) {
+    println!("  Results:");
+
+    for class in CorrelationClass::ALL {
+        let count = results
+            .iter()
+            .filter(|result| result.class == class)
+            .count();
+
+        println!("    {:<20} {}", class.label(), count);
+    }
+}
+
+fn print_diagnostic_examples(results: &[CorrelationResult]) {
+    const EXAMPLES_PER_CLASS: usize = 3;
+
+    for class in CorrelationClass::ALL {
+        let examples = results
+            .iter()
+            .filter(|result| result.class == class)
+            .take(EXAMPLES_PER_CLASS)
+            .collect::<Vec<_>>();
+
+        if examples.is_empty() {
+            continue;
+        }
+
+        println!("  {} examples:", class.label());
+
+        for example in examples {
+            println!(
+                "    source #{} -> product {} -> [{}] candidates: {} — {}",
+                example.source_finding_id,
+                example.target_product_id,
+                example.class.label(),
+                example.candidate_ids_display(),
+                sanitize_title(&example.source_title)
+            );
+        }
+    }
+}
+
+fn sanitize_title(title: &str) -> String {
+    const MAX_CHARACTERS: usize = 120;
+
+    let single_line = title
+        .replace(['\r', '\n'], " ")
+        .trim()
+        .chars()
+        .take(MAX_CHARACTERS)
+        .collect::<String>();
+
+    if title.trim().chars().count() > MAX_CHARACTERS {
+        format!("{single_line}…")
+    } else {
+        single_line
+    }
 }
 
 fn ensure_input_file(path: &Path) -> Result<(), AppError> {
@@ -147,13 +228,12 @@ fn ensure_input_file(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn format_product_ids(product_ids: &[u64]) -> String {
-    if product_ids.is_empty() {
+fn format_ids(ids: &[u64]) -> String {
+    if ids.is_empty() {
         return "<none>".to_owned();
     }
 
-    product_ids
-        .iter()
+    ids.iter()
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ")
