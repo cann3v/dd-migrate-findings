@@ -1,11 +1,13 @@
 mod api;
 mod cli;
 mod config;
+mod dry_run;
 mod error;
 mod matching;
 mod plan;
 mod progress;
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -15,13 +17,17 @@ use crate::api::DefectDojoClient;
 use crate::api::models::Finding;
 use crate::cli::{Cli, Command, ExecutionMode};
 use crate::config::{AppConfig, RuntimeEnvironment};
+use crate::dry_run::{DryRunOutcome, DryRunReport, build_dry_run_report};
 use crate::error::AppError;
 use crate::matching::{
     CorrelationReport, NotFoundReason, SourceCorrelation, SourceCoverageClass, TargetActionClass,
     TargetOperation, correlate_findings,
 };
-use crate::plan::{MigrationPlanBuilder, validate_decision_file, write_plan_files};
-use crate::progress::DownloadProgress;
+use crate::plan::{
+    ApprovedDecisionSet, MigrationPlanBuilder, load_approved_decisions, validate_decision_file,
+    write_plan_files,
+};
+use crate::progress::{DownloadProgress, ItemProgress};
 
 #[tokio::main]
 async fn main() {
@@ -59,14 +65,14 @@ async fn run() -> Result<(), AppError> {
             ensure_input_file(&arguments.decisions)?;
 
             match arguments.execution_mode() {
-                ExecutionMode::DryRun => Err(AppError::StageNotImplemented(format!(
-                    "decision file '{}' can be validated, but \
-                         apply dry-run will be implemented at stage 5",
-                    arguments.decisions.display()
-                ))),
+                ExecutionMode::DryRun => {
+                    let environment = RuntimeEnvironment::load()?;
+
+                    run_apply_dry_run(&config, &environment, &arguments.decisions).await
+                }
 
                 ExecutionMode::Execute => Err(AppError::StageNotImplemented(
-                    "write operations are disabled in stage 4".to_owned(),
+                    "write operations are disabled in stage 5".to_owned(),
                 )),
             }
         }
@@ -353,4 +359,194 @@ fn format_ids(ids: &[u64]) -> String {
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+async fn run_apply_dry_run(
+    config: &AppConfig,
+    environment: &RuntimeEnvironment,
+    decisions_path: &Path,
+) -> Result<(), AppError> {
+    let decisions = load_approved_decisions(decisions_path)?;
+
+    validate_plan_context(config, environment, &decisions)?;
+
+    let client = DefectDojoClient::new(environment, &config.http)?;
+
+    println!("DefectDojo migration dry-run");
+    println!("Approved operations: {}", decisions.operations.len());
+    println!();
+
+    let source_product = &decisions.plan.source_product;
+
+    let (current_sources, source_elapsed) = load_findings_with_progress(
+        &client,
+        source_product.id,
+        &decisions.plan.source_filters,
+        format!(
+            "Refreshing source product [{}] {}",
+            source_product.id, source_product.name
+        ),
+    )
+    .await?;
+
+    println!(
+        "Current source findings: {} ({source_elapsed:?})",
+        current_sources.len()
+    );
+
+    let current_sources = current_sources
+        .into_iter()
+        .map(|finding| (finding.id, finding))
+        .collect::<HashMap<_, _>>();
+
+    let target_ids = decisions
+        .operations
+        .iter()
+        .map(|operation| operation.target_finding_id)
+        .collect::<BTreeSet<_>>();
+
+    let target_progress =
+        ItemProgress::new(target_ids.len(), "Refreshing selected target findings");
+
+    let mut current_targets = HashMap::new();
+
+    for target_id in target_ids {
+        let finding = client.get_finding(target_id).await?;
+
+        current_targets.insert(target_id, finding);
+        target_progress.increment();
+    }
+
+    target_progress.finish();
+
+    let report = build_dry_run_report(
+        &decisions.plan,
+        &decisions.operations,
+        &current_sources,
+        &current_targets,
+    );
+
+    print_dry_run_report(&report);
+
+    println!();
+    println!("No changes were made.");
+    println!("No PATCH or POST requests were sent.");
+
+    Ok(())
+}
+
+fn validate_plan_context(
+    config: &AppConfig,
+    environment: &RuntimeEnvironment,
+    decisions: &ApprovedDecisionSet,
+) -> Result<(), AppError> {
+    if decisions.plan.dojo_base_url != environment.base_url.as_str() {
+        return Err(AppError::InvalidDecisionFile(format!(
+            "plan was created for '{}', but current DOJO_URL is '{}'",
+            decisions.plan.dojo_base_url, environment.base_url
+        )));
+    }
+
+    if decisions.plan.source_product.id != config.source.product_id {
+        return Err(AppError::InvalidDecisionFile(format!(
+            "plan source product is {}, but config source product is {}",
+            decisions.plan.source_product.id, config.source.product_id
+        )));
+    }
+
+    if decisions.plan.source_filters != config.source.filters {
+        return Err(AppError::InvalidDecisionFile(
+            "source filters in plan differ from current config".to_owned(),
+        ));
+    }
+
+    let planned_targets = decisions
+        .plan
+        .destination_products
+        .iter()
+        .map(|product| product.id)
+        .collect::<BTreeSet<_>>();
+
+    let configured_targets = config
+        .destination
+        .product_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    if planned_targets != configured_targets {
+        return Err(AppError::InvalidDecisionFile(
+            "destination products in plan differ from current config".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn print_dry_run_report(report: &DryRunReport) {
+    println!();
+    println!("Dry-run results:");
+
+    for outcome in DryRunOutcome::ALL {
+        let count = report
+            .items
+            .iter()
+            .filter(|item| item.outcome == outcome)
+            .count();
+
+        println!("  {:<24} {}", outcome.label(), count);
+    }
+
+    let ready = report.items.iter().filter_map(|item| item.patch.as_ref());
+
+    let mut description_updates = 0;
+    let mut mitigation_updates = 0;
+    let mut impact_updates = 0;
+
+    for patch in ready {
+        description_updates += usize::from(patch.description.is_some());
+
+        mitigation_updates += usize::from(patch.mitigation.is_some());
+
+        impact_updates += usize::from(patch.impact.is_some());
+    }
+
+    println!("Prepared text additions:");
+    println!("  description: {description_updates}");
+    println!("  mitigation:  {mitigation_updates}");
+    println!("  impact:      {impact_updates}");
+
+    print_dry_run_problem_examples(report);
+}
+
+fn print_dry_run_problem_examples(report: &DryRunReport) {
+    const EXAMPLES: usize = 5;
+
+    for outcome in [
+        DryRunOutcome::SourceChanged,
+        DryRunOutcome::SourceMissing,
+        DryRunOutcome::TargetChanged,
+        DryRunOutcome::TargetMissingFromPlan,
+    ] {
+        let examples = report
+            .items
+            .iter()
+            .filter(|item| item.outcome == outcome)
+            .take(EXAMPLES)
+            .collect::<Vec<_>>();
+
+        if examples.is_empty() {
+            continue;
+        }
+
+        println!("{} examples:", outcome.label());
+
+        for item in examples {
+            println!(
+                "  row {}: source #{} -> target #{} \
+                 in product {}",
+                item.row_id, item.source_finding_id, item.target_finding_id, item.target_product_id
+            );
+        }
+    }
 }

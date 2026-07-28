@@ -84,6 +84,12 @@ impl DefectDojoClient {
         self.get_all_pages(url, observer).await
     }
 
+    pub async fn get_finding(&self, finding_id: u64) -> Result<Finding, AppError> {
+        let url = self.endpoint(&format!("api/v2/findings/{finding_id}/"))?;
+
+        self.get_json(url).await
+    }
+
     pub async fn get_finding_notes(&self, finding_id: u64) -> Result<FindingToNotes, AppError> {
         let url = self.endpoint(&format!("api/v2/findings/{finding_id}/notes/"))?;
 

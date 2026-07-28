@@ -200,4 +200,15 @@ pub enum AppError {
 
     #[error("decision file is invalid: {0}")]
     InvalidDecisionFile(String),
+
+    #[error(
+    "failed to write output file '{}': {source}",
+    path.display()
+    )]
+    WriteOutputFile {
+        path: PathBuf,
+
+        #[source]
+        source: io::Error,
+    },
 }

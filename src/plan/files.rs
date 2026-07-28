@@ -78,84 +78,17 @@ pub fn write_plan_files(
 }
 
 pub fn validate_decision_file(csv_path: &Path) -> Result<DecisionValidationSummary, AppError> {
-    let json_path = csv_path.with_extension("json");
-    let plan = read_plan(&json_path)?;
+    let (_, rows) = load_validated_decision_rows(csv_path)?;
 
-    if plan.schema_version != PLAN_SCHEMA_VERSION {
-        return Err(AppError::InvalidDecisionFile(format!(
-            "unsupported plan schema version {}; expected {}",
-            plan.schema_version, PLAN_SCHEMA_VERSION
-        )));
-    }
+    let apply_all_rows = rows
+        .iter()
+        .filter(|row| row.action == DecisionAction::ApplyAll)
+        .count();
 
-    let expected_rows = build_csv_rows(&plan)
-        .into_iter()
-        .map(|row| (row.row_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(CSV_DELIMITER)
-        .from_path(csv_path)
-        .map_err(|source| AppError::Csv {
-            path: csv_path.to_path_buf(),
-            source,
-        })?;
-
-    let mut seen_row_ids = HashSet::new();
-    let mut total_rows = 0;
-    let mut apply_all_rows = 0;
-    let mut skip_rows = 0;
-
-    for row in reader.deserialize::<CsvDecisionRow>() {
-        let row = row.map_err(|source| AppError::Csv {
-            path: csv_path.to_path_buf(),
-            source,
-        })?;
-
-        if !seen_row_ids.insert(row.row_id.clone()) {
-            return Err(AppError::InvalidDecisionFile(format!(
-                "CSV contains duplicate row_id '{}'",
-                row.row_id
-            )));
-        }
-
-        let expected = expected_rows.get(&row.row_id).ok_or_else(|| {
-            AppError::InvalidDecisionFile(format!("CSV contains unknown row_id '{}'", row.row_id))
-        })?;
-
-        validate_immutable_fields(&row, expected)?;
-        validate_decision(&row)?;
-
-        match row.action {
-            DecisionAction::ApplyAll => {
-                apply_all_rows += 1;
-            }
-            DecisionAction::Skip => {
-                skip_rows += 1;
-            }
-        }
-
-        total_rows += 1;
-    }
-
-    if total_rows != expected_rows.len() {
-        let missing = expected_rows
-            .keys()
-            .filter(|row_id| !seen_row_ids.contains(*row_id))
-            .take(10)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        return Err(AppError::InvalidDecisionFile(format!(
-            "CSV contains {total_rows} rows, but plan expects {}; \
-             missing rows include: {}",
-            expected_rows.len(),
-            missing.join(", ")
-        )));
-    }
+    let skip_rows = rows.len() - apply_all_rows;
 
     Ok(DecisionValidationSummary {
-        total_rows,
+        total_rows: rows.len(),
         apply_all_rows,
         skip_rows,
     })
@@ -242,12 +175,12 @@ fn write_csv(rows: &[CsvDecisionRow], path: &Path) -> Result<(), AppError> {
 
     let mut buffered = BufWriter::new(file);
 
-    // buffered
-    //     .write_all(b"\xEF\xBB\xBF")
-    //     .map_err(|source| AppError::WriteOutputFile {
-    //         path: path.to_path_buf(),
-    //         source,
-    //     })?;
+    buffered
+        .write_all(b"\xEF\xBB\xBF")
+        .map_err(|source| AppError::WriteOutputFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
     let mut writer = csv::WriterBuilder::new()
         .delimiter(CSV_DELIMITER)
@@ -421,4 +354,119 @@ fn validate_output_name(output_name: &str) -> Result<(), AppError> {
                 .to_owned(),
         ))
     }
+}
+
+#[derive(Debug)]
+pub struct ApprovedDecisionSet {
+    pub plan: MigrationPlan,
+    pub operations: Vec<ApprovedOperation>,
+}
+
+#[derive(Debug)]
+pub struct ApprovedOperation {
+    pub row_id: String,
+    pub source_finding_id: u64,
+    pub target_product_id: u64,
+    pub target_finding_id: u64,
+}
+
+pub fn load_approved_decisions(csv_path: &Path) -> Result<ApprovedDecisionSet, AppError> {
+    let (plan, rows) = load_validated_decision_rows(csv_path)?;
+
+    let operations = rows
+        .into_iter()
+        .filter(|row| row.action == DecisionAction::ApplyAll)
+        .map(|row| {
+            let target_finding_id = match row.row_type {
+                CsvRowType::TargetOperation => row
+                    .target_finding_id
+                    .expect("validated target operation must have target ID"),
+
+                CsvRowType::SourceIssue => row
+                    .selected_target_id
+                    .expect("validated applied source issue must have selected target ID"),
+            };
+
+            ApprovedOperation {
+                row_id: row.row_id,
+                source_finding_id: row.source_finding_id,
+                target_product_id: row.target_product_id,
+                target_finding_id,
+            }
+        })
+        .collect();
+
+    Ok(ApprovedDecisionSet { plan, operations })
+}
+
+fn load_validated_decision_rows(
+    csv_path: &Path,
+) -> Result<(MigrationPlan, Vec<CsvDecisionRow>), AppError> {
+    let json_path = csv_path.with_extension("json");
+    let plan = read_plan(&json_path)?;
+
+    if plan.schema_version != PLAN_SCHEMA_VERSION {
+        return Err(AppError::InvalidDecisionFile(format!(
+            "unsupported plan schema version {}; expected {}",
+            plan.schema_version, PLAN_SCHEMA_VERSION
+        )));
+    }
+
+    let expected_rows = build_csv_rows(&plan)
+        .into_iter()
+        .map(|row| (row.row_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(CSV_DELIMITER)
+        .from_path(csv_path)
+        .map_err(|source| AppError::Csv {
+            path: csv_path.to_path_buf(),
+            source,
+        })?;
+
+    let mut seen_row_ids = HashSet::new();
+    let mut actual_rows = Vec::new();
+
+    for row in reader.deserialize::<CsvDecisionRow>() {
+        let row = row.map_err(|source| AppError::Csv {
+            path: csv_path.to_path_buf(),
+            source,
+        })?;
+
+        if !seen_row_ids.insert(row.row_id.clone()) {
+            return Err(AppError::InvalidDecisionFile(format!(
+                "CSV contains duplicate row_id '{}'",
+                row.row_id
+            )));
+        }
+
+        let expected = expected_rows.get(&row.row_id).ok_or_else(|| {
+            AppError::InvalidDecisionFile(format!("CSV contains unknown row_id '{}'", row.row_id))
+        })?;
+
+        validate_immutable_fields(&row, expected)?;
+        validate_decision(&row)?;
+
+        actual_rows.push(row);
+    }
+
+    if actual_rows.len() != expected_rows.len() {
+        let missing = expected_rows
+            .keys()
+            .filter(|row_id| !seen_row_ids.contains(*row_id))
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        return Err(AppError::InvalidDecisionFile(format!(
+            "CSV contains {} rows, but plan expects {}; \
+             missing rows include: {}",
+            actual_rows.len(),
+            expected_rows.len(),
+            missing.join(", ")
+        )));
+    }
+
+    Ok((plan, actual_rows))
 }
