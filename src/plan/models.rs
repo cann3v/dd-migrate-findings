@@ -41,12 +41,3 @@ pub enum DecisionAction {
     ApplyAll,
     Skip,
 }
-
-impl DecisionAction {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ApplyAll => "apply_all",
-            Self::Skip => "skip",
-        }
-    }
-}

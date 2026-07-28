@@ -115,9 +115,6 @@ pub enum AppError {
     #[error("filter contains an unsupported TOML value")]
     UnsupportedFilterValue,
 
-    #[error("{0}")]
-    StageNotImplemented(String),
-
     #[error("migration plan invariant failed: {0}")]
     PlanInvariant(String),
 
